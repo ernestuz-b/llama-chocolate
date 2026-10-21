@@ -32,6 +32,9 @@ After routing and when inputs are ready, initiate independent GPU work on all pa
 ### Chocolate cache memory usage is elastic.
 The cache grows and shrinks, depending on the available VRAM across all devices. It will leave a slack, a portion of free memory, in each device, and it will try to keep it at the correct size plus a hysteresis.
 
+### Elastic eviction releases whole chunks.
+When a chunk is selected for release, **every resident expert in that chunk is evicted**. The controller publishes those experts as CPU-resident for new execution, retaining their statistics; no other resident experts are relocated or compacted. Storage may free the whole chunk only after outstanding GPU users and transfers have finished. Management must not block ordinary inference. See [Elastic chunk lifecycle](chocolate-cache-elasticity.md).
+
 ### The 'statician' and other metadata operators should be kept out the critical path.
 Moving the statistician off the inference path must not introduce a blocking handoff in its place. Most metadata operations should not compete with inference for time, the only allowed ones will be siple ones only affecting a small subset, like updating a counter on each routed expert.
 
