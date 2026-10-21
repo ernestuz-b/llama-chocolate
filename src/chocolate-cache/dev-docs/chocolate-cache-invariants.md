@@ -32,5 +32,9 @@ After routing and when inputs are ready, initiate independent GPU work on all pa
 ### Chocolate cache memory usage is elastic.
 The cache grows and shrinks, depending on the available VRAM across all devices. It will leave a slack, a portion of free memory, in each device, and it will try to keep it at the correct size plus a hysteresis.
 
+### The 'statician' and other metadata operators should be kept out the critical path.
+Moving the statistician off the inference path must not introduce a blocking handoff in its place. Most metadata operations should not compete with inference for time, the only allowed ones will be siple ones only affecting a small subset, like updating a counter on each routed expert.
+
 ### LoRA execution should be possible and correct.
 A distributed Chocolate executor cannot simply bypass build_lora_mm_id() and expect LoRA compatibility to survive. Preserving the complete LoRA-aware computation is an explicit requirement of the execution integration.
+
