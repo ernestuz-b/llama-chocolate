@@ -17,13 +17,17 @@ CPU execution is a normal path, not an emergency fallback requiring synchronous 
 ### Safe residency publication.
 An expert becomes GPU-resident only after its transfer completes. Storage cannot be reused while an outstanding GPU operation still needs it.
 
-## No regression in the zero-hit case.
+### No regression in the zero-hit case.
 If no experts are available in VRAM, execution should perform approximately as well as ordinary CPU execution.
 
-## Correct results regardless of placement.
+### Correct results regardless of placement.
 CPU-only, mixed CPU/GPU and all-GPU execution must preserve the model's numerical behavior. Predictions affect performance, never correctness.
 
-## correctness alone isn't sufficient.
+### Correctness alone isn't sufficient.
 A Chocolate implementation that produces perfect numerical results but serializes CPU and GPU execution violates our performance requirements.
 
+### Chocolate cache mamory usage is elastic.
+The cache grows and shrinks, depending on the available VRAM across all devices. It will leave a slack, a portion of free memory, in each device, and it will try to keep it at the correct size plus a hysteresis.
 
+### LoRA execution should be possible and correct.
+A distributed Chocolate executor cannot simply bypass build_lora_mm_id() and expect LoRA compatibility to survive. Preserving the complete LoRA-aware computation is an explicit requirement of the execution integration.
