@@ -10,7 +10,7 @@ file(GLOB LLAMA_MODELS_SOURCES "models/*.cpp")
 
 # Exactly one MoE cache implementation is linked into libllama.
 if (LLAMA_CHOCOLATE_CACHE)
-    set(LLAMA_MOE_CACHE_SOURCE chocolate-cache/llama-moe-cache.cpp)
+    set(LLAMA_MOE_CACHE_SOURCE chocolate-cache/llama-moe-chocolate-cache.cpp)
     message(STATUS "llama: using Chocolate MoE cache")
 else()
     set(LLAMA_MOE_CACHE_SOURCE llama-moe-cache.cpp)
