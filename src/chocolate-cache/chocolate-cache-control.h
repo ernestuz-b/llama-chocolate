@@ -14,28 +14,21 @@ public:
     using group_id  = uint32_t; // Storage group (device + compatible tensor layout).
     using slot_id   = uint32_t; // Slot index within a group.
 
-    enum class expert_state : uint8_t {
-        untracked,
-        tracked, // Non-resident, with retained usage history.
-        cached,  // Usable GPU copy, not merely a pending transfer.
-    };
-
     struct cache_slot {
         group_id group;
         slot_id  slot;
     };
 
     struct expert_view {
-        expert_state state;
         int32_t  score;
         uint64_t last_use;
         uint32_t window_uses;
         std::optional<cache_slot> location; // Present only when cached.
     };
 
-    // A tracking limit bounds non-resident tracked experts; cached experts do
-    // not occupy the tracking LRU. No cache storage is allocated here.
-    chocolate_cache_control(std::vector<uint32_t> experts_per_layer, size_t tracking_limit);
+    // Every expert has a stable index and persistent accounting from initialization.
+    // No cache storage is allocated here.
+    explicit chocolate_cache_control(std::vector<uint32_t> experts_per_layer);
 
     chocolate_cache_control(const chocolate_cache_control &) = delete;
     chocolate_cache_control & operator=(const chocolate_cache_control &) = delete;
@@ -45,10 +38,12 @@ public:
     size_t expert_count() const noexcept;
     expert_view inspect(expert_id expert) const;
 
-    // Router-confirmed use: enter/touch the tracking LRU if non-resident.
-    // When full, discard the oldest tracked (never a cached) expert's history.
-    // Must be bounded, with no steady-state allocation.
-    void observe(expert_id expert);
+    // Advance once per accepted compute; 0 means no compute observed yet.
+    // Only router-selected experts receive the new ordinal as last_use.
+    // Observation is independent of GPU residency.
+    void begin_compute() noexcept;
+    void observe(expert_id expert) noexcept;
+    uint64_t compute_ordinal() const noexcept;
 
     // Physical slot capacities, provided by storage. Resizing is an
     // off-critical-path operation; shrinking requires affected slots to be
@@ -63,18 +58,12 @@ public:
 
     // The statistician computes these values; this class owns their storage.
     // Further statistical history structures will be designed with its header.
-    void update_statistics(expert_id expert, int32_t score,
-                           uint64_t last_use, uint32_t window_uses);
+    void update_statistics(expert_id expert, int32_t score, uint32_t window_uses);
 
 private:
-    static constexpr expert_id no_expert = static_cast<expert_id>(-1);
-
-    // AoS: small fields normally touched together on use/state transitions.
+    // AoS: residency metadata accessed together when changing placement.
     struct expert_record {
-        expert_state state = expert_state::untracked;
-        expert_id prev = no_expert;
-        expert_id next = no_expert;
-        cache_slot location{}; // Meaningful only when state == cached.
+        std::optional<cache_slot> location; // Only valid after a completed transfer.
     };
 
     std::vector<uint32_t> layer_offsets_; // n_layers + 1.
@@ -89,9 +78,6 @@ private:
     // Reverse residency map; both directions change in one operation.
     std::vector<std::vector<expert_id>> slot_owners_;
 
-    // Tracking LRU contains exactly the non-resident tracked experts.
-    size_t tracking_limit_ = 0;
-    size_t tracked_count_ = 0;
-    expert_id tracked_head_ = no_expert;
-    expert_id tracked_tail_ = no_expert;
+    // One monotonic ordinal for the cache instance, not wall-clock time.
+    uint64_t compute_ordinal_ = 0;
 };
