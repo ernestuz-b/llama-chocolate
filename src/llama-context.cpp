@@ -874,6 +874,11 @@ void llama_context::synchronize() {
     }
 
     ggml_backend_sched_synchronize(sched.get());
+#ifdef LLAMA_CHOCOLATE_CACHE
+    if (moe_cache) {
+        moe_cache->complete_observation();
+    }
+#endif
 
     // FIXME: if multiple single tokens are evaluated without a synchronization,
     // the stats will be added to the prompt evaluation stats
@@ -2801,6 +2806,11 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
         }
 
         st.ids = ids;
+#ifdef LLAMA_CHOCOLATE_CACHE
+        if (lctx->moe_cache) {
+            lctx->moe_cache->observe_router(backend, src, ids, st.ids_data.data(), st.ids_data.size());
+        }
+#endif
     }
 
     // group consecutive experts and copy them together

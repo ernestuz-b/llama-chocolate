@@ -10,7 +10,7 @@ file(GLOB LLAMA_MODELS_SOURCES "models/*.cpp")
 
 # Exactly one MoE cache implementation is linked into libllama.
 if (LLAMA_CHOCOLATE_CACHE)
-    set(LLAMA_MOE_CACHE_SOURCE chocolate-cache/llama-moe-chocolate-cache.cpp)
+    set(LLAMA_MOE_CACHE_SOURCE chocolate-cache/llama-moe-chocolate-cache.cpp chocolate-cache/chocolate-shadow.cpp)
     message(STATUS "llama: using Chocolate MoE cache")
 else()
     set(LLAMA_MOE_CACHE_SOURCE llama-moe-cache.cpp)
@@ -75,6 +75,9 @@ set_source_files_properties(${LLAMA_CORE_SOURCES} ../include/llama.h unicode.h
 configure_file(llama-version.h.in ${CMAKE_CURRENT_BINARY_DIR}/llama-version.h @ONLY)
 
 target_include_directories(llama PRIVATE . ${CMAKE_CURRENT_BINARY_DIR})
+if (LLAMA_CHOCOLATE_CACHE)
+    target_compile_definitions(llama PRIVATE LLAMA_CHOCOLATE_CACHE)
+endif()
 target_include_directories(llama PUBLIC ../include)
 target_compile_features   (llama PRIVATE cxx_std_17) # don't bump
 
