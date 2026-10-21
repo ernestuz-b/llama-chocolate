@@ -2,8 +2,8 @@
 The finished project MUST comply with the invariants listed here.
 
 ## Invariants
-### Experts MUST be spread over all the devices so they can be executed in parallel. 
-For instance, if CUDA0 and CUDA1 devices are available, the cache should spread the experts across both devices so execution of them can be made in parallel.
+### Experts MUST be able to execute in parallel across available devices when beneficial.
+Chocolate must support distributing experts across devices (for instance CUDA0, CUDA1 and CPU) so independent expert work can execute concurrently. Distribution is not mandatory when it would add more overhead than benefit; no device should be forced to execute experts solely to satisfy a placement rule.
 
 ### CPU RAM is authoritative. 
 GPU residency is optional. An uncached expert executes using its canonical CPU weights.
@@ -26,7 +26,10 @@ CPU-only, mixed CPU/GPU and all-GPU execution must preserve the model's numerica
 ### Correctness alone isn't sufficient.
 A Chocolate implementation that produces perfect numerical results but serializes CPU and GPU execution violates our performance requirements.
 
-### Chocolate cache mamory usage is elastic.
+### Execution initiation MUST preserve concurrency.
+After routing and when inputs are ready, initiate independent GPU work on all participating GPUs before entering potentially blocking CPU computation. A CPU backend's `compute_async` call may block its caller even though GPU submission is asynchronous; launching CPU work first can therefore serialize execution. Avoid hidden waits in copy callbacks, transfers and scheduler transitions, and synchronize only where results are genuinely required, after independent work has had an opportunity to start. Verify actual overlap by measurement.
+
+### Chocolate cache memory usage is elastic.
 The cache grows and shrinks, depending on the available VRAM across all devices. It will leave a slack, a portion of free memory, in each device, and it will try to keep it at the correct size plus a hysteresis.
 
 ### LoRA execution should be possible and correct.
