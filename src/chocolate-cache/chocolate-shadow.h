@@ -30,6 +30,7 @@ struct expert_state {
     int32_t pending_slot = -1;
     uint64_t pending_use = 0;
     bool tracked = false;
+    bool linked = false;
 };
 
 struct simulated_expert {
@@ -83,9 +84,20 @@ struct shadow_totals {
     uint64_t simulated_upload_bytes = 0;
     uint64_t placement_disagreements = 0;
     uint64_t rejected_requests = 0;
+    uint64_t rejected_staging = 0;
+    uint64_t mirror_desynchronizations = 0;
+    uint64_t unknown_residency_selections = 0;
+    uint64_t samples = 0;
+    uint64_t complete_samples = 0;
+    uint64_t aborted_samples = 0;
+    uint64_t incomplete_samples = 0;
+    uint64_t missing_routers = 0;
+    uint64_t scan_visits = 0;
+    uint64_t statistics_ns = 0;
+    uint64_t simulation_ns = 0;
 };
 
-// One serialized host owner. All topology, history and scratch storage is allocated at construction.
+// One management owner. Numeric identities survive vector relocation; no router pointers are retained.
 class shadow_cache {
 public:
     shadow_cache(const std::vector<layer_config> & layers, const std::vector<group_config> & groups,
@@ -94,12 +106,21 @@ public:
     shadow_cache(const shadow_cache &) = delete;
     shadow_cache & operator=(const shadow_cache &) = delete;
 
-    bool observe(const router_view & router) noexcept;
+    void begin_sample(bool expect_all_layers = false);
+    bool finish_sample(bool compute_complete = true, bool coverage_complete = true);
+    // Without an explicit begin, a view is a standalone replay sample.
+    bool observe(const router_view & router);
     // Stage after vanilla queues a fill; confirm only at an existing backend completion boundary.
     bool stage_actual(int32_t layer, uint32_t expert, uint32_t slot) noexcept;
     void complete_actual(size_t group) noexcept;
     void complete_actual() noexcept;
     void set_tracking_capacity(size_t capacity) noexcept;
+    void invalidate_actual(size_t group) noexcept;
+    void invalidate_observation() noexcept;
+    bool actual_valid(size_t group) const noexcept;
+    bool statistics_valid() const noexcept { return history_valid; }
+    size_t expert_count() const noexcept { return experts.size(); }
+    void release_unused_storage();
 
     const expert_state * find(int32_t layer, uint32_t expert) const noexcept;
     const shadow_totals & totals() const noexcept { return counts; }
@@ -127,6 +148,7 @@ private:
         std::vector<uint32_t> simulated;
         std::vector<resident_rank> ranks;
         size_t n_pending = 0;
+        bool valid = true;
     };
     struct window_entry {
         uint32_t id;
@@ -138,6 +160,8 @@ private:
     void admit(uint32_t id) noexcept;
     void trim() noexcept;
     void evict_simulated(uint32_t id) noexcept;
+    bool observe_router(const router_view & router);
+    bool prepare_bucket(size_t size, std::vector<window_entry> & replacement);
 
     std::vector<layer_state> layers;
     std::vector<group_state> groups;
@@ -146,6 +170,7 @@ private:
     std::vector<uint32_t> group_of;
     std::vector<uint8_t> selected;
     std::vector<uint32_t> used;
+    std::vector<uint8_t> observed_layers;
     std::vector<std::vector<window_entry>> buckets;
     statistics_params params;
     int32_t score_min;
@@ -159,6 +184,10 @@ private:
     uint32_t head = no_expert;
     uint32_t tail = no_expert;
     shadow_totals counts;
+    bool sample_active = false;
+    bool sample_valid = false;
+    bool expect_all = false;
+    bool history_valid = true;
 };
 
 } // namespace chocolate

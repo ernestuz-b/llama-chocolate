@@ -1,130 +1,132 @@
-# M1: shadow metadata and cache simulation
+# M1R: reliable shadow observation and metadata management
 
-Validated on 2026-10-21 in the private `ernestuz-b/llama-chocolate` fork. Starting commit: `660bd6aa6e46ca9f26b1b896f7582a43f52de242`, after the user updated the checkout. The final local commit SHA is supplied in the completion message; this report is included in that commit. No push or merge is authorized or performed.
+Validated on 2026-10-21 in the private Chocolate fork. Starting SHA: `ed8f18609a6bbbb9ee86c23301786ce76478ad2d`. The completion message supplies the final local SHA. No push or merge is performed. This report replaces the M1 report; the original evidence and per-layer statistical convention remain available in the starting commit.
 
-## Changes and ownership
+## Changed files
 
-- `src/chocolate-cache/chocolate-shadow.{h,cpp}`: metadata, tracking LRU, statistics, independent simulation and explicit dump.
-- `src/chocolate-cache/llama-moe-chocolate-cache.cpp`: observer ownership and adapters around existing readbacks, fill notifications and shutdown telemetry.
-- `src/llama-context.cpp`: feed the generic copy callback's existing host IDs to Chocolate; confirm residency after an existing scheduler synchronization. Both hooks compile only with Chocolate enabled.
-- `src/llama-moe-cache.h`: two internal observer method declarations required by those hooks. This is the shared internal header, not the installed public API.
-- `src/CMakeLists.txt`: select the shadow source and private observation macro only for Chocolate.
-- `tests/test-chocolate-shadow.cpp`, `tests/chocolate-shadow-replay.txt`, `tests/CMakeLists.txt`: standalone tests, deterministic file replay, a golden replay result and a processing benchmark.
+- `src/chocolate-cache/chocolate-shadow.{h,cpp}`: compute samples, failure accounting, mirror validity, explicit LRU membership, lifetime counters and elastic window buckets.
+- `src/chocolate-cache/chocolate-observation.{h,cpp}`: bounded capture ring and one metadata worker per native cache/context.
+- `src/chocolate-cache/llama-moe-chocolate-cache.cpp`: capture adapters, independent backend-completion notifications and shutdown reporting.
+- `src/llama-context.cpp`: initialization, explicit graph-compute sample markers and notifications after existing synchronization calls.
+- `src/llama-moe-cache.h`: guard all Chocolate declarations.
+- Root and `src` CMake files: thread dependency and Chocolate source selection.
+- `tests/CMakeLists.txt`, `tests/test-chocolate-shadow.cpp`: retain replay/fuzz checks; add failure, sample, LRU, resize, threaded handoff and performance coverage.
+- `tests/test-llama-archs.cpp`, `tests/test_chocolate_integration.py`: committed synthetic inference fixture and ON/OFF comparison driver.
 - This report.
 
-The Chocolate cache implementation owns one `chocolate::shadow_cache`. It owns a fixed dense expert table, immutable layer offsets and group identities, numeric tracking links, rolling buckets, reusable selection scratch and separate actual/pending/simulated slot tables. Logical identity is `layer.begin + expert`, independent of a physical slot. Lookup, LRU touch, removal and admission are O(1).
+The user's pre-existing change to `chocolate-cache-invariants.md` is preserved and excluded from this commit.
 
-The metadata record is 64 bytes on this host. Its history contains `last_use`, `score`, `window_uses` and a saturating selection count. The remaining fields hold numeric links, tracking generation and observed actual/pending placement. Only confirmed router use admits a tracking record. Promotion removes it from the nonresident LRU; demotion returns it at MRU without clearing history. Tracking eviction clears history. Generation-tagged buckets cannot expire history belonging to a later readmission.
+## Observation-to-management handoff
 
-All vectors and bucket capacities are allocated during initialization. Growing and shrinking the active tracked population does not move logical identities or resize backing storage. There are no retained router pointers. Physical release/compaction of metadata backing storage is not implemented. Production retains every used expert in the eligible topology; only tests/replay can impose a smaller nonresident tracking capacity. No production tracking threshold was invented.
+The serialized context thread is the sole producer. It copies router IDs from existing host readbacks into a fixed SPSC ring, and records sample markers, native fill facts and existing synchronization notifications. The ring contains values and logical identities; it retains no graph, tensor, backend or router pointers. Producer methods do not allocate, resize, rank, scan the expert population, update statistics or wait for queue space. Existing native readback-vector allocations are unchanged.
 
-Simulation has its own 16-byte-per-expert score/recency/slot record. This separate history is necessary: actual residency can protect an observed tracking record from eviction, and must not thereby determine simulated ranking. Tests compare simulation with different actual placements and tracking capacities.
+One worker owns the original `shadow_cache`, tracking LRU, statistical buckets, scores, actual mirror and independent simulator. It also owns reusable router scratch storage. There is no new task pool or inference-thread mutex. Notifications wake a condition variable; a worker-side 1 ms timed recheck prevents lost notifications from stalling management. Only synchronized context destruction joins the worker. No GPU call is made by the worker.
 
-## Fakecache reuse
+Capacity is derived from eligible layers, maximum routed width and `cparams.n_batch`. It budgets every token as a separate microbatch, including router, fill and completion records, and reserves two batch budgets for independent producer/consumer progress. This conservative bound also covers small microbatches inside a larger decode batch. It is fixed at initialization and has no production tuning parameter. An unbounded stream without sufficient existing completion points, or a persistently slower worker, can still exhaust it.
 
-Inspected Fakecache checkout `/mnt/AI/AiProgs/experiments/llama-fakecache`, HEAD `bfae85005f36c529e66c58c8663411349335f781`: `expert-state.h`, `statistics.{h,cpp}`, `cache-controller.{h,cpp}`, `iresident-policy.h`, `resident-policy.{h,cpp}`, `resident-cache.h`, and resident policy/storage/statistics tests.
+On exhaustion, the producer immediately counts lost events and disables further capture. Management invalidates history and all residency mirrors; it does not turn missing selections into zero use. Management allocation/processing exceptions follow the same invalidation path and set a separate failure flag. Context recreation is the recovery boundary. No speculative reconstruction or additional GPU wait is used.
 
-Adapted the dense owner/table contract, minimum history fields, bounded eager score decay/rise, once-per-request rolling-window membership, saturating factual counters and reusable markers/buckets. The resident ranking implementation preserves Fakecache's lexicographic `(score, last_use)` ordering, strictly stronger admission, equality without churn and lowest-index weakest tie. Boundary tests include the unique weakest final slot. A separate probe compiled against the existing Fakecache statistics source passed 32,000 direct history comparisons.
+## Compute sample and completion boundaries
 
-The controller, resident storage and lifecycle tests informed ownership, numeric identities and publication at completion boundaries. Their device storage machinery was not ported. No rotating-buffer architecture or prediction/publication/execution subsystem was introduced.
+A sample is exactly one invocation of `llama_context::graph_compute()` from `process_ubatch()`. Begin/end markers surround the existing `ggml_backend_sched_graph_compute_async()` call. Thus one decoder microbatch, including its observed layers, contributes at most one ordinal and one domain scan. Encode also uses this graph-compute boundary. A whole multi-microbatch `llama_decode()` call is not one sample.
 
-## Observation and residency
+Scheduler return means submission status. It is not GPU completion. The worker retains an end marker until an existing full scheduler synchronization acknowledges its serial. Notifications come from `llama_context::synchronize()` and the existing pipeline graph-reuse synchronization. A synchronization acknowledges earlier explicitly delimited samples; it never creates or merges them. Metadata can lag inference until such an acknowledgement. Shutdown without an end marker or completion acknowledgement invalidates the sample.
 
-1. The Chocolate slot-map `copy()` callback consumes IDs after its existing readback and synchronization, before the unchanged SLRU plan. `build_moe_cache_slots()` flattens IDs; the adapter obtains the original token/lane shape from the reshape source without another readback or graph scan.
-2. The generic `llama_context::sched_copy_experts()` path consumes the existing host readback when its ID cache is refreshed. The immutable host weight binding identifies the logical layer. Observation remains valid if this operation executes on a backend different from that layer's cache backend. The real cache's backend check remains unchanged.
-3. Fill notifications update only shadow actual/pending tables after vanilla queues its original copies. Pending fills become confirmed residency at an existing matching-backend synchronization, the context's existing scheduler synchronization, or synchronized context destruction. No new backend wait, event or readback is introduced. Before a known completion boundary, pending metadata is conservative.
+- Successful submission plus complete router coverage over the eligible topology, followed by completion acknowledgement, commits a complete sample.
+- Failed submission with a fully captured eligible-layer prefix, followed by acknowledgement, commits an aborted sample using Fakecache's convention. An empty known aborted prefix also advances its ordinal.
+- Rejected routers, duplicate layer views, missing eligible layers, gaps in an aborted prefix or explicitly unknown coverage prevent a statistical commit. Ordinal, buckets and decay do not advance. History stays invalid afterward; later observations cannot repair an unknown interval silently.
+- Factual router selections remain separate from successful execution. Known selections and lifetime counters can be captured even for an aborted/incomplete sample.
+- A user eval callback can truncate execution while the scheduler returns success. Such samples are explicitly marked as having unknown coverage. The callback and scheduler are not modified.
 
-Router observations count confirmed selections even if a later compute fails; they do not claim successful execution. Actual-residency selection counts describe availability in the native cache, not measured execution hits. Native cache counters remain separately reported.
+Output pruning may shorten later token rows. No transition alignment is inferred. The clock is per actual graph compute, so changing microbatch grouping can change the number of samples, as in Fakecache's multi-token compute convention. It no longer changes decay frequency merely by changing the number of observed layers.
 
-Coverage is bounded to existing cache bindings and readbacks. CPU-only contexts without a native cache, ineligible layers, a generic copy whose split does not start with the qualifying `MUL_MAT_ID`, and execution paths without either host readback are not observed. No eval callback, graph/scheduler change or extra synchronization was added to close those gaps. All selections were observed in the tested eligible single- and two-GPU workloads, including the large-batch path.
+## Residency consistency and failures
 
-## Simulation contract and remaining policy decisions
+Backend completion is captured immediately after the native synchronization, before router-shape validation, in both existing readback paths. It confirms only groups owned by that backend. Full scheduler completion confirms all groups. A rejected observation therefore cannot strand an otherwise completed native fill.
 
-Each simulated group uses exactly its vanilla group's usable `n_slots` and sum of expert tensor `nb[2]` values. The native extra guard slot and alignment padding are not usable capacity. Groups retain vanilla's existing layer/device partition. Actual admissions, victims and slot assignments are never simulator inputs.
+Fill facts are captured after native copies are queued. Management stages them independently of usage acceptance. Slot replacement demotes the previous logical occupant; pending entries become actual only at a recorded completion. Completion checks pending ownership before publication. One group completing cannot publish another group's pending data.
 
-Each request counts hits/misses against pre-request simulated residency. A miss is hypothetically CPU-served for that request. After updating history, distinct selected candidates are considered in logical identity order using Fakecache ranking. A promotion becomes available for the next request and estimates one full expert upload; eviction and population counters follow these hypothetical changes. There is no timing, execution graph, bandwidth or throughput simulation.
+Every staging rejection is counted and invalidates the affected group's mirror. An unknown logical identity invalidates all groups conservatively. Invalid groups clear their claimed placements and count later residency selections as unknown. Their simulated occupants remain independent. A router rejection invalidates usage history at sample closure without invalidating an otherwise consistent residency mirror. Overflow or management failure invalidates both because transfer notifications may also be missing.
 
-The inherited Fakecache defaults are `window=1`, `decay=1`, `rise=2`; constructor tests exercise other values. Score bounds are `[-decay*window, (rise-decay)*window]`. Here an ordinal/window bucket is one observed layer router request, not a whole compute. Duplicate selections count separately in factual frequency/hits/misses but affect score/window membership once per request. Replay accepts duplicate lanes as well as duplicates across token rows.
+Shutdown logs aggregate router/staging failures, incomplete samples, missing routers, lost events, desynchronized groups, history validity and management failure. `LLAMA_CHOCOLATE_DUMP=/path` adds group validity, pending counts and full records. There is no per-token failure logging. Aggregates preceding invalidation describe a captured prefix; validity flags must accompany their interpretation. There is no in-place resynchronization after a mirror failure in this milestone.
 
-Production tracking capacity, the production score/window settings, a compute/token epoch convention and any additional candidate eligibility rules remain unresolved. The simulator currently considers every selected expert in its eligible group. Its ranking history is not limited by the observed metadata's test-only tracking cap. Results depend on batching/observation grouping and must include that configuration. Simulated hits and CPU service are not measured performance improvements.
+The native SLRU, admission, victims, slots, uploads and execution remain authoritative. `src/llama-moe-cache.cpp`, `src/llama-graph.cpp`, `ggml/src/ggml-backend.cpp` and `include/llama.h` are unchanged. The SLRU definition in the Chocolate implementation is byte-identical to the starting version. Neither `build_moe_ffn()` nor `build_lora_mm_id()` changes. No extra readback or GPU synchronization is added.
+
+## Statistics, LRU and allocation
+
+Fakecache reuse is source-grounded in `src/fakecache/statistics.{h,cpp}`, `expert-state.h` and `resident-policy.cpp` from the sibling Fakecache checkout. The adaptation retains dense numeric identity, one ordinal per complete/known-aborted compute sample, once-per-sample selected membership, exact rolling expiration, full-domain bounded eager decay/rise, saturating factual counters and lexicographic `(score,last_use)` ranking. Empty-slot, strictly stronger admission and weakest-slot tie rules are unchanged.
+
+Scores now decay over the complete simulation domain, including experts not yet selected. First tracking admission inherits that expert's prior bounded score. Tracking eviction deliberately forgets tracked score, recency and window history; readmission creates a new generation. Generation-tagged buckets cannot expire a later generation's membership. Per-expert factual lifetime selection counters survive eviction and readmission. Pending transfer evidence survives tracking eviction and retains its committed router ordinal at completion.
+
+LRU membership is an explicit `linked` flag. Unlink ignores nonmembers and cannot decrement an empty population. Touch, removal, admission and eviction remain O(1), with numeric head/tail and neighbor links. Cached records remain exempt from nonresident tracking eviction. Simulation score/recency/occupants are separate and are not chosen using native placement or tracking protection.
+
+Window vectors start empty. They grow for actual distinct sample membership and contract when a reused bucket needs much less capacity. Allocation is prepared before changing statistical history. Reusable scratch can also be contracted on the management path; resize/regrowth tests retain numeric identities. Stable dense expert records remain allocated for the fixed eligible topology. Live topology changes and elastic GPU storage are not implemented.
 
 ## Validation
 
-All artifacts and complete logs are in `/tmp/chocolate-m1-evidence/`. The temporary inference probe reuses the existing architecture-test fixture helpers; it is a validation artifact, not a new execution implementation.
+Final logs, binaries, complete inference traces and a hash manifest are in `/tmp/chocolate-m1r-evidence/`.
 
 | Check | Result |
 | --- | --- |
-| Standalone strict build: `g++ -std=c++17 -O2 -Wall -Wextra -Wpedantic -Werror -Isrc tests/test-chocolate-shadow.cpp src/chocolate-cache/chocolate-shadow.cpp -o /tmp/test-chocolate-shadow` | Passed |
-| `/tmp/test-chocolate-shadow` | 58,973 checks, 0 failures |
-| CTest `^test-chocolate-shadow` | 2/2 passed, including golden file replay |
-| ASan/UBSan standalone build/run | 58,973 checks, 0 failures; `ASAN_OPTIONS=detect_leaks=0`, LeakSanitizer unvalidated |
-| Existing Fakecache statistics parity probe | 32,000 comparisons passed |
-| CUDA-enabled `test-llama-archs` build, Chocolate OFF and ON | Both passed |
-| Existing `test-llama-archs -a deepseek2 -s 1234`, OFF and ON | 6/6 passed in each build, including native cache, host experts, round-trip and mixed-batch checks |
-| Seeded Qwen3 MoE inference probe, OFF versus ON | Bitwise equality, identical graph assignment traces and identical native cache counter lines on CPU, CUDA0, CUDA1 and an explicit two-GPU layer split |
-| Nonzero MoE LoRA on the up-expert matrix | Changed outputs; retained bitwise OFF/ON equality in every backend case |
-| `git diff --check` | Passed |
+| Strict standalone GCC, C++17, `-Wall -Wextra -Wpedantic -Werror` | 362,868 checks, zero failures |
+| CTest `^test-chocolate-shadow` | 2/2 passed, including unchanged golden file replay |
+| ASan/UBSan | 362,868 checks, zero failures; `ASAN_OPTIONS=detect_leaks=0`; LeakSanitizer unvalidated |
+| Direct compilation against Fakecache statistics | 24,000 multi-layer complete/aborted sample comparisons passed |
+| Committed scalar Fakecache oracle, replay, randomized LRU and threaded queue tests | Passed |
+| Allocation fault, overflow, missing-end, unconfirmed-end, router rejection and staging failure injection | Passed |
+| Existing DeepSeek2 architecture/cache regression on CUDA0, ON and OFF | 3/3 in each; host experts, native cache, round-trip and mixed-batch comparisons retained |
+| Committed ON/OFF inference driver, CPU and CUDA0 | 47,616 logits per backend bitwise identical; nonzero LoRA effects verified for both microbatch settings; native counters and graph traces identical |
 
-The Qwen3 probe uses two layers, eight experts per layer, top-K two, seed 1234 and generated F32 weights. It decodes batches of 1, 2, 16, 64, 1, 1 and 8 tokens, with `n_ubatch=2` and `64`, with and without the LoRA. `GGML_OP_OFFLOAD_MIN_BATCH=1` is set before initialization. Each backend case compares 47,616 logits. CUDA0 is the RTX 4060; CUDA1 is the RTX 5060 Ti. The two-GPU case explicitly verifies one MoE layer on each device, with group capacities 2 and 8; individual GPU cases use a shared five-slot group. Both microbatch configurations observe all 372 selections per workload, with zero rejected observations. The larger microbatch configuration observes all 14 layer requests; the smaller one observes 96.
+The inference fixture has two Qwen3MoE layers, eight experts/layer, K=2, generated F32 weights (seed 1234), and nonzero rank-four expert-up LoRA (seed 99). Batches are 1, 2, 16, 64, 1, 1 and 8; microbatch limits are 2 and 64. `GGML_OP_OFFLOAD_MIN_BATCH=1` is set before initialization. CUDA0 is the RTX 4060. Each GPU context observes all 372 selections: 96 router views/48 samples or 14 views/7 samples, with no rejected, missing or lost observations and valid mirrors. CPU-only contexts have no native cache observer.
 
-| Backend | Equal ON/OFF logit SHA256 | Equal graph trace lines |
-| --- | --- | --- |
-| CUDA0 | `51733c9b14bcb12ff91efb82a296fe0f507c7d85b1785db68a1cbe0097bada19` | 6,140 |
-| CUDA1 | `f1e47992c92b6473d0f7c6ea1c2fd7cbbd4e3cc20dd3caecd069838f5fd10e71` | 6,140 |
-| Both | `f1967f8f8957ac717cdb72d81df7caf04fe2042231d60b30a15ead29493e2ba8` | 6,202 |
-| CPU | `0c49a02c81878bc8fda9e39fd15054edf1b6de724c362a3aa42c0a811178309d` | 5,822 |
+The final CPU logit SHA256 is `0c49a02c81878bc8fda9e39fd15054edf1b6de724c362a3aa42c0a811178309d`; CUDA0 is `51733c9b14bcb12ff91efb82a296fe0f507c7d85b1785db68a1cbe0097bada19`. Equal graph trace counts are 5,822 and 6,140 respectively.
 
-Full pretrained-model and quantized-cache numerical comparisons were not run. The tests above exercise real inference on synthetic fixtures, not just replay. They do not establish speed gains or CPU/GPU overlap.
+CUDA1 (RTX 5060 Ti) and two-GPU execution are not validated for M1R. CUDA1 initialization failed with out-of-memory; a read-only device check showed only 227 MiB free. The general architecture run also encountered that occupied device. The retained `both` fixture verifies one layer per GPU when resources permit. These failures do not replace current dual-GPU evidence with M1's historical results.
 
-## Actual versus simulated example
+ThreadSanitizer compiled but failed before the tests with `FATAL: ThreadSanitizer: unexpected memory mapping`. Concurrency is covered by the real worker regression and ASan/UBSan, without a ThreadSanitizer claim. Python type-check and editorconfig executables are not installed; syntax, changed-line whitespace and ASCII checks are used locally.
 
-CUDA0, no LoRA, five usable slots, 372 selections. Values are from `on-CUDA0.log` and `validated-on-CUDA0.dump`; OFF has identical native counter lines.
+## Capture, processing and memory measurements
 
-| Statistic | `n_ubatch=2` | `n_ubatch=64` |
-| --- | --- | --- |
-| Native measured unique cache hits / misses | 62 / 247 | 12 / 6 |
-| Native measured cache-fill bytes | 291,373,056 | 7,077,888 |
-| Native large-batch cache copies, per tensor expert slice | 0 | 45, totaling 17,694,720 bytes |
-| Observed resident / nonresident selections | 73 / 299 | 101 / 271 |
-| Simulated GPU hits / CPU-served misses | 100 / 272 | 25 / 347 |
-| Simulated promotions / evictions | 230 / 225 | 35 / 30 |
-| Simulated uploaded expert bytes | 271,319,040 | 41,287,680 |
-| Final observed / simulated residency | 5 / 5 | 5 / 5 |
-| Selection placement disagreements | 81 | 92 |
+The committed `--benchmark` measures 100 samples, 48 layers x 128 experts, K=8 and 256 shared slots. A one-token sample also captures 384 deterministic native fill notifications and matching completions; the 256-token large-batch case captures no cache fills. Processing occurs separately on the management/test owner. The benchmark capture capacity equals the tested token count; production instead uses `cparams.n_batch`, independently of the current sample size. No timing threshold is asserted.
 
-Native fill counters count distinct experts per native plan, while selection counters include duplicates. Native cache-fill bytes omit generic host uploads; cache-copy counters describe device copies. These are not total measured transfer traffic and must not be compared as if the units and coverage were identical.
+| Tokens/sample | Window | Capture ns/layer, including notifications | Total management us/sample | Statistics us/sample | Simulation/ranking us/sample | Metadata bytes | Bytes including transport |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 1 | 1 | 91.5 | 105.8 | 10.9 | 70.4 | 561,616 | 611,304 |
+| 256 | 1 | 580.1 | 3,553.5 | 53.8 | 2,765.4 | 653,776 | 13,294,344 |
+| 1 | 256 | 75.9 | 92.9 | 12.0 | 60.7 | 1,175,992 | 1,225,680 |
+| 256 | 256 | 549.4 | 3,373.8 | 82.3 | 2,605.3 | 10,391,992 | 23,032,560 |
 
-## Memory and processing overhead
+All four capture measurements recorded zero producer allocations and exactly 614,400 scan visits: one 6,144-expert scan per sample. Total management includes event consumption, factual counters, LRU/placement maintenance and scratch copies; statistics includes bucket allocation/expiration and the domain update; simulation includes sorting, ranking and trimming. These are host point measurements, not end-to-end inference slowdown, worker scheduling latency, throughput gains or CPU/GPU overlap evidence. M1's 10.3/79.4 us reference measured synchronous per-layer processing, so it is not directly comparable to per-sample management here.
 
-`test-chocolate-shadow --benchmark` uses 48 layers, 128 experts/layer, top-K eight, 256 shared slots, inherited statistics defaults and 4,800 layer requests per case. The one-token case also stages/confirms actual mirror replacements; both cases include completion checks. On this host, the recorded sample was:
+The record sizes remain 64 bytes actual metadata plus 16 bytes independent simulation, with additional dense indices, flags and reusable scratch. At 6,144 experts, an empty window of 1/256/4,096 consumes 555,472/561,592/653,752 metadata bytes. Window cost starts with O(window) vector headers, not reserved O(window x experts) entries. Membership allocation reflects actual distinct selections in retained samples. The window-256 benchmark has populated 100 buckets, not the full 256-bucket steady state; dense continued use will allocate further required memberships.
 
-| Tokens per layer request | Time/request | Time/selection | Capacity-based host storage | C++ allocations during processing |
+With a capture budget for 256 tokens and K=8:
+
+| Experts | Empty window | Metadata bytes | One context, transport included | Two independent contexts |
 | --- | --- | --- | --- | --- |
-| 1 | 10.475 us | 1,309.3 ns | 653,600 bytes, about 638.3 KiB | 0 |
-| 256 | 79.399 us | 38.8 ns | 653,600 bytes | 0 |
+| 1,024 | 1 | 99,080 | 2,245,696 | 4,491,392 |
+| 1,024 | 4,096 | 197,360 | 2,343,976 | 4,687,952 |
+| 6,144 | 1 | 555,472 | 13,187,848 | 26,375,696 |
+| 6,144 | 4,096 | 653,752 | 13,286,128 | 26,572,256 |
 
-Storage includes the manager object, topology, vector capacities, observed/simulated records, markers, ranks and preallocated generation-tagged window buckets. It excludes allocator bookkeeping and the enclosing cache owner's pointer. Storage grows with topology, window length and usable slots; active tracking contraction does not release the reserved storage. Processing includes an eager scan of the expert table and resident-rank scans; these timings are a sample of observer processing, not end-to-end inference overhead or an improvement claim. Existing inference allocations/readbacks were not removed; no new ones were added by metadata processing.
+The conservative capture ring can dominate memory; its bound grows with batch capacity, eligible layers and routed width, independently of statistics window. The 6,144-expert, 256-token ring alone is 12,632,112 bytes. This is a declared CPU-memory tradeoff for bounded capture across the smallest possible microbatches. Per-context costs add; contexts do not share mutable metadata. Figures include persistent vector capacities and object storage, and exclude allocator bookkeeping, transient resize replacements, thread runtime/stack and the enclosing owner's pointer. Each context also has one implementation-dependent worker stack. These figures do not describe GPU cache allocation.
 
-## Reproduction and telemetry
+## Reproduction and remaining limits
+
+From the repository root, create separate static ON/OFF builds using the same compiler/backend options:
 
 ```sh
-cmake -S . -B /tmp/chocolate-m1-on -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES='89;120' -DCMAKE_BUILD_TYPE=Release -DLLAMA_CURL=OFF -DLLAMA_BUILD_TESTS=ON -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_TOOLS=ON -DBUILD_SHARED_LIBS=OFF -DLLAMA_CHOCOLATE_CACHE=ON
-cmake --build /tmp/chocolate-m1-on --target test-chocolate-shadow test-llama-archs -j 12
-ctest --test-dir /tmp/chocolate-m1-on -R '^test-chocolate-shadow' --output-on-failure -V
-/tmp/chocolate-m1-on/bin/test-chocolate-shadow --replay tests/chocolate-shadow-replay.txt
-/tmp/chocolate-m1-on/bin/test-chocolate-shadow --benchmark
+cmake -S . -B /tmp/chocolate-on -DBUILD_SHARED_LIBS=OFF -DLLAMA_BUILD_TESTS=ON -DLLAMA_CHOCOLATE_CACHE=ON -DGGML_CUDA=ON
+cmake -S . -B /tmp/chocolate-off -DBUILD_SHARED_LIBS=OFF -DLLAMA_BUILD_TESTS=ON -DLLAMA_CHOCOLATE_CACHE=OFF -DGGML_CUDA=ON
+cmake --build /tmp/chocolate-on --target test-chocolate-shadow test-llama-archs -j8
+cmake --build /tmp/chocolate-off --target test-llama-archs -j8
+ctest --test-dir /tmp/chocolate-on -R '^test-chocolate-shadow' --output-on-failure
+python3 tests/test_chocolate_integration.py --on /tmp/chocolate-on/bin/test-llama-archs --off /tmp/chocolate-off/bin/test-llama-archs --backends CPU CUDA0 --output-dir /tmp/chocolate-integration
+/tmp/chocolate-on/bin/test-chocolate-shadow --benchmark
 ```
 
-The inference comparison reconfigures that same build directory with OFF, builds, and runs `python3 /tmp/chocolate-m1-evidence/compile-probe.py off`, then repeats with ON and `compile-probe.py on`. CUDA backend objects are reused; each static probe embeds its selected cache implementation. Run each `inference-{on,off} OUTPUT BACKEND` for `CPU`, `CUDA0`, `CUDA1`, `both`, then `python3 /tmp/chocolate-m1-evidence/compare.py`. GPU execution required access outside the filesystem sandbox. The build directory finishes configured ON.
+Use `-DGGML_CUDA=OFF` and `--backends CPU` for CPU-only reproduction. Add `CUDA1 both` when both devices have resources. The actual validation reused `/tmp/chocolate-m1-on` between static ON/OFF configurations and preserved each executable in the evidence directory. The committed driver does not depend on temporary M1 probe sources.
 
-Temporary probe source SHA256: `3ed5f9ddd0ff569dbec79478871ec0e229b74c77f650e5a7ea69f0efc29459e5`. The helper source, compiler/link helper, comparison script, binary logits, logs and detailed dumps remain in the evidence directory. `comparison.log`, `unit.log`, `ctest.log`, `sanitizer.log`, `fakecache-parity.log`, `benchmark.log` and `archs-{on,off}.log` record the results.
+Coverage still requires an eligible native cache layer and one of the two existing host-router readback paths. CPU-only/ineligible layers and generic splits without the qualifying first `MUL_MAT_ID` remain outside coverage. Missing eligible views invalidate statistics. Actual cross-group/device identity is fixed; no expert migrates between groups. Tests cover cross-layer replacement within a shared group and independent completion/replacement across groups.
 
-Replay format starts with layer/group counts, then one `n_expert group` pair per layer and one `capacity expert_bytes` pair per group. `R layer lanes tokens ids...` supplies a router request, `S layer expert slot` records a queued vanilla fill, `C group` records completion, and `T capacity` sets the test-only tracking cap. Blank lines and full-line `#` comments are accepted. The fixture exercises cross-layer replacement, duplicates, tracking eviction and actual/simulated independence. Replay prints aggregates and records deterministically.
-
-Normal inference adds only aggregated shutdown summaries after the native measured statistics. Set `LLAMA_CHOCOLATE_DUMP=/path/to/file` to append detailed records, topology, history, actual/pending/simulated placement and LRU links at cache destruction. This dump setting does not change policy. File I/O occurs only at destruction, after synchronization.
-
-## Execution boundary and review
-
-`src/llama-moe-cache.cpp`, `src/llama-graph.cpp` and `ggml/src/ggml-backend.cpp` are byte-identical to the starting commit. The complete SLRU source is unchanged, SHA256 `c94fd6e0fc7a93debb1909cef0db6539262d125086277ebd85525b3ac30f732c`. Original graph construction, LoRA execution, native cache allocation, slot selection, transfer ordering, copy/execution dispatch and scheduling remain authoritative. New simulation state is never read to decide real work.
-
-Self-review applied the repository skill's scope, security, approach/design, tests and general checklists. IDs, shapes, strides, score arithmetic and capacities are checked; invalid observations leave history/placement unchanged except for their rejection counter. Metadata setup failure disables observation with a warning and preserves native inference. There is no public API change, production tracking tuning parameter, new dependency, actual promotion policy, elasticity, speculative scheduler or mixed-execution implementation.
+Defaults remain `window=1, decay=1, rise=2`; production score/window selection, tracking retention policy and hypothetical admission policy refinements remain decisions for later milestones. Synthetic F32 inference is validated on CPU/CUDA0; pretrained, quantized-cache, current two-GPU, real inference abort and malformed-router integration fault injection remain unvalidated. Rejection/staging/abort mechanics are covered in committed manager/transport tests. Dense expert topology remains fixed; metadata history/scratch elasticity does not implement GPU residency elasticity.

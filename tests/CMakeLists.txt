@@ -136,7 +136,8 @@ endfunction()
 
 # build test-tokenizer-0 target once and add many tests
 if (LLAMA_CHOCOLATE_CACHE)
-    add_executable(test-chocolate-shadow test-chocolate-shadow.cpp ../src/chocolate-cache/chocolate-shadow.cpp)
+    add_executable(test-chocolate-shadow test-chocolate-shadow.cpp ../src/chocolate-cache/chocolate-shadow.cpp ../src/chocolate-cache/chocolate-observation.cpp)
+    target_link_libraries(test-chocolate-shadow PRIVATE Threads::Threads)
     target_include_directories(test-chocolate-shadow PRIVATE ../src)
     target_compile_features(test-chocolate-shadow PRIVATE cxx_std_17)
     llama_test(test-chocolate-shadow)

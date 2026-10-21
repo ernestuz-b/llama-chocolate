@@ -550,6 +550,9 @@ llama_context::llama_context(
 
         if (cparams.moe_cache_size > 0) {
             moe_cache = std::make_unique<llama_moe_cache>(model, backend_ptrs, backend_buft, cparams.moe_cache_size);
+#ifdef LLAMA_CHOCOLATE_CACHE
+            if (!model.hparams.no_alloc) { moe_cache->init_observation(cparams.n_batch); }
+#endif
         }
 
         sched_reserve();
@@ -1531,6 +1534,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         // that the previous compute is still reading.
         if (cparams.pipeline_parallel) {
             ggml_backend_sched_synchronize(sched.get());
+#ifdef LLAMA_CHOCOLATE_CACHE
+            if (moe_cache) { moe_cache->complete_observation(); }
+#endif
         }
 
         n_reused++;
@@ -2754,7 +2760,13 @@ ggml_status llama_context::graph_compute(
 
     copy_experts.reset();
 
+#ifdef LLAMA_CHOCOLATE_CACHE
+    if (moe_cache) { moe_cache->begin_observation(); }
+#endif
     auto status = ggml_backend_sched_graph_compute_async(sched.get(), gf);
+#ifdef LLAMA_CHOCOLATE_CACHE
+    if (moe_cache) { moe_cache->end_observation(status == GGML_STATUS_SUCCESS, cparams.cb_eval == nullptr); }
+#endif
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: ggml_backend_sched_graph_compute_async failed with error %d\n", __func__, status);
     }
@@ -2795,6 +2807,9 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
         st.ids_data.resize(ggml_nbytes(ids)/sizeof(int32_t));
         ggml_backend_tensor_get_async(backend, ids, st.ids_data.data(), 0, ggml_nbytes(ids));
         ggml_backend_synchronize(backend);
+#ifdef LLAMA_CHOCOLATE_CACHE
+        if (lctx->moe_cache) { lctx->moe_cache->complete_observation(backend); }
+#endif
 
         st.used.assign(n_expert, false);
         for (int64_t i1 = 0; i1 < ids->ne[1]; i1++) {
