@@ -1,5 +1,4 @@
 #include "llama-moe-chocolate-cache.h"
-#include "chocolate-observation.h"
 
 #include "llama-impl.h"
 #include "llama-model.h"
@@ -7,7 +6,6 @@
 #include "ggml-cpp.h"
 
 #include <algorithm>
-#include <cstdlib>
 #include <stdexcept>
 #include <unordered_map>
 #include <vector>
@@ -245,7 +243,6 @@ struct llama_moe_cache::impl {
 
     std::vector<int32_t> ids;
     std::vector<moe_cache_slru::fill> fills;
-    std::unique_ptr<chocolate::observation_queue> observations;
 
     // slot maps in host memory
     ggml_context_ptr ctx_host;
@@ -488,58 +485,12 @@ struct llama_moe_cache::impl {
         }
     }
 
-    void init_observation(size_t max_tokens) {
-        try {
-            std::vector<chocolate::layer_config> shadow_layers(layers.size());
-            std::vector<chocolate::group_config> shadow_groups(groups.size());
-            for (size_t ig = 0; ig < groups.size(); ++ig) {
-                const group & g = groups[ig];
-                if (g.n_slots == 0) { continue; }
-                uint64_t expert_bytes = 0;
-                for (const auto * t : g.ref) {
-                    if (t->nb[2] > UINT64_MAX - expert_bytes) { throw std::overflow_error("shadow expert size overflow"); }
-                    expert_bytes += t->nb[2];
-                }
-                shadow_groups[ig] = {uint32_t(g.n_slots), expert_bytes};
-                for (int32_t il : g.layers) {
-                    if (g.ref[0]->ne[2] <= 0 || uint64_t(g.ref[0]->ne[2]) > INT32_MAX) {
-                        throw std::overflow_error("shadow expert domain overflow");
-                    }
-                    shadow_layers[il] = {uint32_t(g.ref[0]->ne[2]), int32_t(ig)};
-                }
-            }
-            observations = std::make_unique<chocolate::observation_queue>(shadow_layers, shadow_groups, max_tokens, size_t(n_expert_used));
-        } catch (const std::exception & e) {
-            LLAMA_LOG_WARN("%s: Chocolate observation disabled: %s\n", __func__, e.what());
-        }
-    }
-
     ggml_backend_t backend(int32_t il) const {
         return devices[groups[layers[il].ig].id].backend;
     }
 
     ~impl() {
-        // llama_context synchronizes before destroying its cache.
-        if (observations) { observations->stop(); }
         log_stats();
-    }
-
-    void complete_observation(ggml_backend_t backend = nullptr) {
-        if (!observations) { return; }
-        if (!backend) { observations->complete_all(); return; }
-        for (size_t ig = 0; ig < groups.size(); ++ig) {
-            if (devices[groups[ig].id].backend == backend) { observations->complete_group(ig); }
-        }
-    }
-
-    void observe_router(int32_t il, const ggml_tensor * sel, const int32_t * data, size_t size) {
-        if (!observations) { return; }
-        if (!sel || sel->type != GGML_TYPE_I32 || sel->ne[0] <= 0 || sel->ne[1] <= 0 || sel->ne[2] != 1 || sel->ne[3] != 1 ||
-            sel->nb[0] % sizeof(int32_t) || sel->nb[1] % sizeof(int32_t)) {
-            observations->router({});
-            return;
-        }
-        observations->router({il, data, size, size_t(sel->ne[0]), size_t(sel->ne[1]), sel->nb[0] / sizeof(int32_t), sel->nb[1] / sizeof(int32_t)});
     }
 
     ggml_tensor * get_slot_map(int32_t il, int64_t n_tokens, int64_t n_expert_used) const {
@@ -631,14 +582,6 @@ struct llama_moe_cache::impl {
         ids.resize(ggml_nelements(sel));
         ggml_backend_tensor_get_async(backend, sel, ids.data(), 0, ggml_nbytes(sel));
         ggml_backend_synchronize(backend);
-        complete_observation(backend);
-        // build_moe_cache_slots flattens the router; its reshape source keeps the token/lane shape.
-        const ggml_tensor * router = sel->op == GGML_OP_RESHAPE ? sel->src[0] : nullptr;
-        if (router && ggml_is_contiguous(router) && ggml_nelements(router) == int64_t(ids.size())) {
-            observe_router(il, router, ids.data(), ids.size());
-        } else if (observations) {
-            observations->router({});
-        }
 
         size_t n_hit = 0;
         if (!g.slru.plan(il, ids.data(), ids.size(), fills, n_hit)) {
@@ -670,10 +613,6 @@ struct llama_moe_cache::impl {
         // the next copy synchronizes the backend before it changes the slot map again
         ggml_backend_tensor_set_async(backend, dst, src->data, 0, ggml_nbytes(src));
 
-        if (observations) {
-            for (const auto & fill : fills) { observations->stage(il, uint32_t(fill.expert), uint32_t(fill.slot)); }
-        }
-
         return true;
     }
 
@@ -690,31 +629,6 @@ struct llama_moe_cache::impl {
         log("ubatch  > 8", stats_large);
         if (stats_copy.hits > 0) {
             LLAMA_LOG_INFO("llama_moe_cache: large batches: %zu experts copied from the cache, %.2f MiB\n", stats_copy.hits, stats_copy.bytes/1024.0/1024.0);
-        }
-        if (observations) {
-            const auto & shadow = observations->metadata();
-            const auto & st = shadow.totals();
-            LLAMA_LOG_INFO("chocolate metadata: requests = %llu, selections = %llu, tracked = %zu, actual resident = %zu, rejected = %llu, host bytes = %zu\n",
-                (unsigned long long) st.requests, (unsigned long long) st.selections, shadow.tracked_count(), shadow.actual_count(),
-                (unsigned long long) st.rejected_requests, observations->memory_bytes());
-            LLAMA_LOG_INFO("chocolate simulation: hits = %llu, misses/CPU = %llu, promotions = %llu, evictions = %llu, upload bytes = %llu, resident = %zu, selection placement disagreements = %llu\n",
-                (unsigned long long) st.simulated_hits, (unsigned long long) st.simulated_cpu_selections, (unsigned long long) st.simulated_promotions,
-                (unsigned long long) st.simulated_evictions, (unsigned long long) st.simulated_upload_bytes, shadow.simulated_count(),
-                (unsigned long long) st.placement_disagreements);
-            LLAMA_LOG_INFO("chocolate reliability: samples = %llu, complete = %llu, aborted = %llu, incomplete = %llu, missing routers = %llu, rejected staging = %llu, desynchronized groups = %llu, lost events = %llu, history valid = %d, management failed = %d\n",
-                (unsigned long long) st.samples, (unsigned long long) st.complete_samples, (unsigned long long) st.aborted_samples,
-                (unsigned long long) st.incomplete_samples, (unsigned long long) st.missing_routers, (unsigned long long) st.rejected_staging,
-                (unsigned long long) st.mirror_desynchronizations, (unsigned long long) observations->lost_events(),
-                int(shadow.statistics_valid()), int(observations->management_failed()));
-            const char * path = std::getenv("LLAMA_CHOCOLATE_DUMP");
-            if (path && *path) {
-                if (FILE * out = ggml_fopen(path, "a")) {
-                    observations->dump(out, true);
-                    std::fclose(out);
-                } else {
-                    LLAMA_LOG_WARN("chocolate: cannot append metadata dump to '%s'\n", path);
-                }
-            }
         }
     }
 };
@@ -743,29 +657,6 @@ bool llama_moe_cache::copy(ggml_backend_t backend, const ggml_tensor * src, ggml
 
 int64_t llama_moe_cache::copy_experts(ggml_backend_t backend, const ggml_tensor * w, ggml_tensor * dst, int64_t e, int64_t last) {
     return pimpl->copy_experts(backend, w, dst, e, last);
-}
-
-void llama_moe_cache::observe_router(ggml_backend_t, const ggml_tensor * w, const ggml_tensor * ids, const int32_t * data, size_t size) {
-    const auto it = pimpl->bindings.find(w);
-    if (it != pimpl->bindings.end()) {
-        pimpl->observe_router(it->second.il, ids, data, size);
-    }
-}
-
-void llama_moe_cache::complete_observation(ggml_backend_t backend) {
-    pimpl->complete_observation(backend);
-}
-
-void llama_moe_cache::init_observation(size_t max_tokens) {
-    pimpl->init_observation(max_tokens);
-}
-
-void llama_moe_cache::begin_observation() {
-    if (pimpl->observations) { pimpl->observations->begin(); }
-}
-
-void llama_moe_cache::end_observation(bool submitted, bool coverage_complete) {
-    if (pimpl->observations) { pimpl->observations->end(submitted, coverage_complete); }
 }
 
 std::map<ggml_backend_buffer_type_t, size_t> llama_moe_cache::memory_breakdown() const {

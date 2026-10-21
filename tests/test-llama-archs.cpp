@@ -10,7 +10,6 @@
 // TODO: replace with #include "llama-ext.h" in the future
 #include "../src/llama-arch.h"
 #include "../src/llama-model-saver.h"
-#include "../src/llama-model.h"
 
 #include <cinttypes>
 #include <cmath>
@@ -136,7 +135,6 @@ static void usage(char ** argv) {
     LOG("  -o, --out <dir>          Save generated test models to <dir> instead of running backend tests\n");
     LOG("  -v <N>                   Set log verbosity level\n");
     LOG("  -b, --backend <backend>  Run only on the given backend device\n");
-    LOG("  --chocolate-probe <file> <backend>  Write deterministic MoE/LoRA logits for ON/OFF comparison\n");
     LOG("  -h, --help               Show this help message\n\n");
     LOG("Examples:\n");
     LOG("  %s\n", argv[0]);
@@ -1231,113 +1229,7 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
     return all_ok ? 0 : 1;
 }
 
-static llama_adapter_lora * make_chocolate_adapter(llama_model * model) {
-    const auto * w = model->layers[0].ffn_up_exps;
-    if (!w) { throw std::runtime_error("missing up experts"); }
-    const int64_t rank = 4;
-    ggml_init_params init{size_t((w->ne[0] + w->ne[1]) * rank * w->ne[2]) * sizeof(float) + 4 * ggml_tensor_overhead(), nullptr, false};
-    ggml_context_ptr ctx(ggml_init(init));
-    gguf_context_ptr adapter(gguf_init_empty());
-    if (!ctx || !adapter) { throw std::runtime_error("adapter allocation failed"); }
-    gguf_set_val_str(adapter.get(), "general.type", "adapter");
-    gguf_set_val_str(adapter.get(), "general.architecture", "qwen3moe");
-    gguf_set_val_str(adapter.get(), "adapter.type", "lora");
-    gguf_set_val_f32(adapter.get(), "adapter.lora.alpha", float(rank));
-    auto * a = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, w->ne[0], rank, w->ne[2]);
-    auto * b = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, rank, w->ne[1], w->ne[2]);
-    ggml_set_name(a, (std::string(w->name) + ".lora_a").c_str());
-    ggml_set_name(b, (std::string(w->name) + ".lora_b").c_str());
-    std::mt19937 random(99);
-    std::normal_distribution<float> dis(0, 0.05f);
-    for (auto * t : {a, b}) {
-        auto * data = static_cast<float *>(t->data);
-        for (int64_t i = 0; i < ggml_nelements(t); ++i) { data[i] = dis(random); }
-        gguf_add_tensor(adapter.get(), t);
-    }
-    std::unique_ptr<FILE, decltype(&std::fclose)> file(tmpfile(), std::fclose);
-    if (!file || !gguf_write_to_file_ptr(adapter.get(), file.get(), false)) { throw std::runtime_error("adapter write failed"); }
-    rewind(file.get());
-    auto * result = llama_adapter_lora_init_from_file_ptr(model, file.get());
-    if (!result) { throw std::runtime_error("adapter load failed"); }
-    return result;
-}
-
-static int chocolate_probe(const char * output_path, const char * backend_name) {
-    common_set_env("GGML_OP_OFFLOAD_MIN_BATCH", "1");
-    common_set_env("GGML_SCHED_DEBUG", "2");
-    common_init();
-    llama_backend_init();
-    auto log = [](ggml_log_level, const char * text, void *) { std::fputs(text, stderr); };
-    llama_log_set(log, nullptr);
-    ggml_log_set(log, nullptr);
-    std::vector<ggml_backend_dev_t> devices;
-    if (std::string(backend_name) != "CPU") {
-        if (std::string(backend_name) == "both") {
-            devices = {ggml_backend_dev_by_name("CUDA0"), ggml_backend_dev_by_name("CUDA1")};
-        } else { devices = {ggml_backend_dev_by_name(backend_name)}; }
-        for (auto d : devices) { if (!d) { return 3; } }
-    }
-    const llama_model_tensor_buft_override overrides[] = {
-        {LLM_FFN_EXPS_REGEX, ggml_backend_cpu_buffer_type()}, {nullptr, nullptr}
-    };
-    auto meta = get_gguf_ctx(LLM_ARCH_QWEN3MOE, true);
-    gguf_set_val_u32(meta.get(), "qwen3moe.expert_count", 8);
-    tensor_data_params tensor_params{1234, 0.1f};
-    auto mp = llama_model_default_params();
-    auto terminated = devices;
-    terminated.push_back(nullptr);
-    mp.devices = terminated.data();
-    mp.split_mode = LLAMA_SPLIT_MODE_LAYER;
-    std::vector<float> balanced_split(llama_max_devices(), 0);
-    if (devices.size() == 2) {
-        balanced_split[0] = 1;
-        balanced_split[1] = 3;
-        mp.tensor_split = balanced_split.data();
-    }
-    mp.tensor_buft_overrides = overrides;
-    mp.progress_callback = silent_model_load_progress;
-    llama_model_ptr model(llama_model_init_from_user(meta.get(), set_tensor_data, &tensor_params, mp));
-    if (!model) { return 4; }
-    const auto tokens = get_tokens(128, 128, 1234);
-    std::unique_ptr<FILE, decltype(&std::fclose)> output(ggml_fopen(output_path, "wb"), std::fclose);
-    if (!output) { return 5; }
-    llama_adapter_lora_ptr adapter(make_chocolate_adapter(model.get()));
-    for (uint32_t ubatch : {2u, 64u}) {
-        for (int lora : {0, 1}) {
-            auto cp = llama_context_default_params();
-            cp.n_ctx = 512;
-            cp.n_batch = 128;
-            cp.n_ubatch = ubatch;
-            cp.n_threads = cp.n_threads_batch = 4;
-            const auto & first = model->layers[0];
-            const size_t expert_bytes = first.ffn_up_exps->nb[2] + first.ffn_gate_exps->nb[2] + first.ffn_down_exps->nb[2];
-            cp.moe_cache_size = devices.empty() ? 0 : (devices.size() == 2 ? 12 : 6) * expert_bytes;
-            std::fprintf(stderr, "PROBE ubatch=%u lora=%d backend=%s\n", ubatch, lora, backend_name);
-            llama_context_ptr ctx(llama_init_from_model(model.get(), cp));
-            if (!ctx) { return 6; }
-            if (lora) {
-                float scale = 1;
-                auto * selected_adapter = adapter.get();
-                if (llama_set_adapters_lora(ctx.get(), &selected_adapter, 1, &scale)) { return 7; }
-            }
-            for (size_t count : {size_t(1), size_t(2), size_t(16), size_t(64), size_t(1), size_t(1), size_t(8)}) {
-                llama_memory_clear(llama_get_memory(ctx.get()), true);
-                std::vector<llama_token> batch(tokens.begin(), tokens.begin() + count);
-                const auto logits = get_logits(model.get(), ctx.get(), batch);
-                for (float value : logits) { if (!std::isfinite(value)) { return 8; } }
-                if (std::fwrite(logits.data(), sizeof(float), logits.size(), output.get()) != logits.size()) { return 9; }
-                std::fprintf(stderr, "PROBE batch=%zu logits=%zu\n", count, logits.size());
-            }
-        }
-    }
-    return std::fclose(output.release()) == 0 ? 0 : 9;
-}
-
 int main(int argc, char ** argv) {
-    if (argc == 4 && std::strcmp(argv[1], "--chocolate-probe") == 0) {
-        try { return chocolate_probe(argv[2], argv[3]); }
-        catch (const std::exception & e) { std::fprintf(stderr, "%s\n", e.what()); return 1; }
-    }
     // init the logger at max verbosity. filter with a custom callback respecting the user-configure verbosity
     common_log_set_verbosity_thold(LOG_LEVEL_DEBUG);
     common_init();

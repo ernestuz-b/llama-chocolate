@@ -32,15 +32,6 @@ public:
     // returns the number of experts copied, 0 if expert e is not in the cache
     int64_t copy_experts(ggml_backend_t backend, const ggml_tensor * w, ggml_tensor * dst, int64_t e, int64_t last);
 
-#ifdef LLAMA_CHOCOLATE_CACHE
-    // Chocolate only: consume the generic copy path's existing host router readback.
-    void observe_router(ggml_backend_t backend, const ggml_tensor * w, const ggml_tensor * ids, const int32_t * data, size_t size);
-    void complete_observation(ggml_backend_t backend = nullptr);
-    void init_observation(size_t max_tokens);
-    void begin_observation();
-    void end_observation(bool submitted, bool coverage_complete);
-#endif
-
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const;
 
 private:

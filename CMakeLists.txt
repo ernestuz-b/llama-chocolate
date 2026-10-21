@@ -120,9 +120,6 @@ option(LLAMA_ALL_WARNINGS_3RD_PARTY "llama: enable all compiler warnings in 3rd 
 # build
 option(LLAMA_FATAL_WARNINGS "llama: enable -Werror flag" OFF)
 option(LLAMA_CHOCOLATE_CACHE "llama: use Chocolate MoE cache implementation" ON)
-if (LLAMA_CHOCOLATE_CACHE)
-    find_package(Threads REQUIRED)
-endif()
 
 # sanitizers
 option(LLAMA_SANITIZE_THREAD    "llama: enable thread sanitizer"    OFF)

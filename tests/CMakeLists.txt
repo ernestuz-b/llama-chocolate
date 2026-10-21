@@ -135,16 +135,6 @@ function(llama_build_and_test source)
 endfunction()
 
 # build test-tokenizer-0 target once and add many tests
-if (LLAMA_CHOCOLATE_CACHE)
-    add_executable(test-chocolate-shadow test-chocolate-shadow.cpp ../src/chocolate-cache/chocolate-shadow.cpp ../src/chocolate-cache/chocolate-observation.cpp)
-    target_link_libraries(test-chocolate-shadow PRIVATE Threads::Threads)
-    target_include_directories(test-chocolate-shadow PRIVATE ../src)
-    target_compile_features(test-chocolate-shadow PRIVATE cxx_std_17)
-    llama_test(test-chocolate-shadow)
-    llama_test(test-chocolate-shadow NAME test-chocolate-shadow-replay ARGS --replay ${CMAKE_CURRENT_SOURCE_DIR}/chocolate-shadow-replay.txt)
-    set_tests_properties(test-chocolate-shadow-replay PROPERTIES PASS_REGULAR_EXPRESSION "simulated: hits=2 misses=9 cpu=9 promotions=6 evictions=4 upload_bytes=600 resident=2 disagreements=1")
-endif()
-
 llama_build(test-tokenizer-0.cpp)
 
 llama_test(test-tokenizer-0 NAME test-tokenizer-0-bert-bge          ARGS ${PROJECT_SOURCE_DIR}/models/ggml-vocab-bert-bge.gguf)
