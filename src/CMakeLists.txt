@@ -8,6 +8,15 @@ llama_add_compile_flags()
 
 file(GLOB LLAMA_MODELS_SOURCES "models/*.cpp")
 
+# Exactly one MoE cache implementation is linked into libllama.
+if (LLAMA_CHOCOLATE_CACHE)
+    set(LLAMA_MOE_CACHE_SOURCE chocolate-cache/llama-moe-cache.cpp)
+    message(STATUS "llama: using Chocolate MoE cache")
+else()
+    set(LLAMA_MOE_CACHE_SOURCE llama-moe-cache.cpp)
+    message(STATUS "llama: using vanilla MoE cache")
+endif()
+
 set(LLAMA_CORE_SOURCES
     llama.cpp
     llama-adapter.cpp
@@ -28,7 +37,7 @@ set(LLAMA_CORE_SOURCES
     llama-kv-cache-msa.cpp
     llama-kv-cache-dsv4.cpp
     llama-memory.cpp
-    llama-moe-cache.cpp
+    ${LLAMA_MOE_CACHE_SOURCE}
     llama-memory-hybrid.cpp
     llama-memory-hybrid-iswa.cpp
     llama-memory-hybrid-idx.cpp
