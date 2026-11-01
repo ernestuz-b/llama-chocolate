@@ -1,0 +1,75 @@
+name: Chocolate one-time upstream sync
+on:
+  push:
+    branches:
+      - sync/upstream-2026-11-01
+    paths:
+      - .github/workflows/chocolate-sync-once.yml
+
+permissions:
+  contents: write
+
+jobs:
+  synchronize:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Import pinned upstream, preserve Chocolate, check CPU builds, publish
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "Chocolate upstream sync"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git fetch --no-tags --depth=1 https://github.com/ggml-org/llama.cpp.git dde879bc4f954b809892fd0d660515f42536394a
+          UPSTREAM="$(git rev-parse FETCH_HEAD)"
+          [ "$UPSTREAM" = "dde879bc4f954b809892fd0d660515f42536394a" ]
+          TEMP="$(mktemp -d)"
+          cp -a src/chocolate-cache "$TEMP/chocolate-cache"
+          git read-tree --reset -u FETCH_HEAD
+          cp -a "$TEMP/chocolate-cache" src/chocolate-cache
+          python3 - <<'PY'
+          from pathlib import Path
+          root = Path("CMakeLists.txt")
+          src  = Path("src/CMakeLists.txt")
+          ch   = Path("src/chocolate-cache/llama-moe-chocolate-cache.cpp")
+          vanilla = Path("src/llama-moe-cache.cpp")
+          r = root.read_text()
+          marker = 'option(LLAMA_BUILD_COMMON'
+          assert r.count(marker) == 1, 'root CMake insertion point changed'
+          r = r.replace(marker, 'option(LLAMA_CHOCOLATE_CACHE "llama: use Chocolate MoE cache implementation" ON)\n\n' + marker, 1)
+          root.write_text(r)
+          s = src.read_text()
+          assert s.count('set(LLAMA_CORE_SOURCES') == 1
+          assert s.count('    llama-moe-cache.cpp\n') == 1
+          select = '''# Exactly one MoE cache implementation is linked into libllama.
+          if (LLAMA_CHOCOLATE_CACHE)
+              set(LLAMA_MOE_CACHE_SOURCE chocolate-cache/llama-moe-chocolate-cache.cpp)
+              message(STATUS "llama: using Chocolate MoE cache")
+          else()
+              set(LLAMA_MOE_CACHE_SOURCE llama-moe-cache.cpp)
+              message(STATUS "llama: using vanilla MoE cache")
+          endif()
+
+          '''
+          s = s.replace('set(LLAMA_CORE_SOURCES', select + 'set(LLAMA_CORE_SOURCES', 1)
+          s = s.replace('    llama-moe-cache.cpp\n', '    ${LLAMA_MOE_CACHE_SOURCE}\n', 1)
+          src.write_text(s)
+          v = vanilla.read_text()
+          assert v.count('#include "llama-moe-cache.h"') == 1
+          ch.write_text(v.replace('#include "llama-moe-cache.h"', '#include "llama-moe-chocolate-cache.h"', 1))
+          assert 'const llama_model & model, bool no_alloc' in ch.read_text()
+          print("Chocolate source updated from exact upstream MoE cache; headers and dev docs preserved")
+          PY
+          git add -A
+          git commit -m "chore: sync upstream llama.cpp to dde879bc4 (2026-11-01)" -m "Preserve Chocolate-specific design headers and docs, retain the ON/OFF source selection, and mirror latest vanilla MoE cache source under Chocolate with the include path changed. Includes no_alloc compatibility."
+          echo "Differences from pinned upstream (expected: 2 CMake files and Chocolate directory):"
+          git diff --name-only "$UPSTREAM" HEAD
+          git diff --name-only "$UPSTREAM" HEAD | grep -v -E '^(CMakeLists\.txt|src/CMakeLists\.txt|src/chocolate-cache/)' && { echo "unexpected differences to upstream"; exit 1; } || true
+          cmake -S . -B build-off -DCMAKE_BUILD_TYPE=Release -DLLAMA_CHOCOLATE_CACHE=OFF -DLLAMA_BUILD_COMMON=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_TOOLS=OFF -DLLAMA_BUILD_EXAMPLES=OFF -DGGML_CUDA=OFF -DBUILD_SHARED_LIBS=OFF
+          cmake --build build-off --target llama -j 4
+          cmake -S . -B build-on -DCMAKE_BUILD_TYPE=Release -DLLAMA_CHOCOLATE_CACHE=ON -DLLAMA_BUILD_COMMON=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_TOOLS=OFF -DLLAMA_BUILD_EXAMPLES=OFF -DGGML_CUDA=OFF -DBUILD_SHARED_LIBS=OFF
+          cmake --build build-on --target llama -j 4
+          git push origin HEAD:sync/upstream-2026-11-01
